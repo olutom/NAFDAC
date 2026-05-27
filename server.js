@@ -15,11 +15,11 @@
 
 const express   = require('express');
 const axios     = require('axios');
-const cheerio   = require('cheerio');
 const rateLimit = require('express-rate-limit');
 const helmet    = require('helmet');
 const cors      = require('cors');
 const NodeCache = require('node-cache');
+const { chromium } = require('playwright');
 
 const app   = express();
 const cache = new NodeCache({ stdTTL: 86400 }); // 24-hour cache
@@ -30,24 +30,14 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50kb' }));
 app.set('trust proxy', 1);
 
-// Rate limit
+// Global rate limit
 app.use(rateLimit({
-  windowMs : 60_000,
-  max      : 100,
+  windowMs: 60_000,
+  max: 100,
   standardHeaders: true,
-  legacyHeaders  : false,
-  message  : { error: 'Too many requests. Please slow down.' }
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please slow down.' }
 }));
-
-// ─── NAFDAC Client (FIXED HTTPS) ──────────────────────────────────────────────
-const nafdacClient = axios.create({
-  baseURL : 'https://greenbook.nafdac.gov.ng',
-  timeout : 20000,
-  headers : {
-    'User-Agent' : 'Mozilla/5.0 (compatible; NafdacCheckBot/1.1)',
-    'Accept'     : 'text/html,application/json,*/*',
-  },
-});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function sanitize(str, maxLen = 200) {
@@ -55,90 +45,65 @@ function sanitize(str, maxLen = 200) {
   return str.replace(/[<>"'%;()&+]/g, '').trim().slice(0, maxLen);
 }
 
-function mapProduct(raw) {
-  return {
-    id: sanitize(String(raw.id ?? raw.nrn ?? Math.random())),
-    product_name: sanitize(raw.product_name ?? raw['Product Name'] ?? ''),
-    active_ingredients: sanitize(raw.active_ingredients ?? raw['Active Ingredients'] ?? ''),
-    nrn: sanitize(raw.nrn ?? raw['NRN'] ?? raw['NAFDAC Reg. No.'] ?? ''),
-    applicant_name: sanitize(raw.applicant_name ?? raw['Applicant Name'] ?? ''),
-    product_category: sanitize(raw.product_category ?? raw['Product Category'] ?? ''),
-    form: sanitize(raw.form ?? raw['Form'] ?? ''),
-    roa: sanitize(raw.roa ?? raw['ROA'] ?? ''),
-    strengths: sanitize(raw.strengths ?? raw['Strengths'] ?? ''),
-    approval_date: sanitize(raw.approval_date ?? raw['Approval Date'] ?? ''),
-    status: sanitize(raw.status ?? 'active'),
-    expiry_date: raw.expiry_date ? sanitize(raw.expiry_date) : null,
-    synonym: raw.synonym ? sanitize(raw.synonym) : null,
-  };
-}
-
-// ─── IMPROVED SCRAPER ─────────────────────────────────────────────────────────
-function scrapeHtml(html) {
-  if (!html || typeof html !== 'string') return [];
-
-  const $ = cheerio.load(html);
-  const results = [];
-
-  const headers = [];
-  $('table thead th').each((_, el) => {
-    headers.push($(el).text().trim());
-  });
-
-  $('table tbody tr, tr').each((_, tr) => {
-    const cells = $(tr).find('td');
-    if (!cells.length) return;
-
-    const row = {};
-
-    cells.each((i, td) => {
-      const key = headers[i] || `col${i}`;
-      row[key] = $(td).text().trim();
-    });
-
-    if (Object.values(row).some(Boolean)) {
-      results.push(mapProduct(row));
-    }
-  });
-
-  return results;
-}
-
-// ─── Fetch Logic (FIXED FALLBACKS) ───────────────────────────────────────────
+// ─── NAFDAC SCRAPER (PLAYWRIGHT - FIXED WORKING VERSION) ─────────────────────
 async function fetchNafdac(params) {
   const key = `nafdac_${JSON.stringify(params)}`;
   const hit = cache.get(key);
   if (hit) return hit;
 
-  let products = [];
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  let results = [];
 
   try {
-    const res = await nafdacClient.get('/products', { params });
-    const body = res.data;
+    const query = params.search || '';
 
-    if (Array.isArray(body)) {
-      products = body.map(mapProduct);
+    await page.goto('https://greenbook.nafdac.gov.ng/', {
+      waitUntil: 'networkidle',
+    });
+
+    // Try find search input
+    const input = await page.$('input[type="text"], input[name="search"]');
+
+    if (input) {
+      await input.fill(query);
+      await page.keyboard.press('Enter');
     }
-    else if (Array.isArray(body?.data)) {
-      products = body.data.map(mapProduct);
-    }
-    else {
-      products = scrapeHtml(typeof body === 'string' ? body : '');
-    }
+
+    // Wait for results
+    await page.waitForTimeout(5000);
+
+    // Extract table data
+    const data = await page.$$eval('table tbody tr', rows =>
+      rows.map(row =>
+        Array.from(row.querySelectorAll('td')).map(td => td.innerText.trim())
+      )
+    );
+
+    await browser.close();
+
+    results = data.map(row => ({
+      product_name: row[0] || '',
+      active_ingredients: row[1] || '',
+      product_category: row[2] || '',
+      nrn: row[5] || '',
+      form: row[6] || '',
+      roa: row[7] || '',
+      strengths: row[8] || '',
+      applicant_name: row[9] || '',
+      approval_date: row[10] || '',
+      status: row[11] || ''
+    }));
+
+    cache.set(key, results);
+    return results;
+
   } catch (err) {
-    console.log('[Primary fetch failed]', err.message);
-
-    try {
-      const res = await nafdacClient.get('/', { params });
-      products = scrapeHtml(res.data);
-    } catch (e) {
-      console.log('[Fallback fetch failed]', e.message);
-      products = [];
-    }
+    console.log('[Playwright error]', err.message);
+    await browser.close();
+    return [];
   }
-
-  cache.set(key, products);
-  return products;
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -147,36 +112,37 @@ app.get('/health', (_, res) => {
   res.json({ status: 'ok', version: '1.1.0', ts: Date.now() });
 });
 
+/**
+ * SEARCH DRUGS
+ */
 app.get('/api/drugs/search', async (req, res) => {
   const q = sanitize(String(req.query.q ?? ''));
-  const limit = Math.min(Math.max(parseInt(req.query.limit ?? '20', 10), 1), 100);
 
   if (!q || q.length < 2) {
     return res.status(400).json({ error: 'q must be at least 2 characters' });
   }
 
   try {
-    const results = await fetchNafdac({ search: q, limit });
-    return res.json(results);
+    const results = await fetchNafdac({ search: q });
+    res.json(results);
   } catch (err) {
     console.error('[search error]', err.message);
-    return res.status(502).json({ error: 'Could not reach NAFDAC database.' });
+    res.status(502).json({ error: 'Could not fetch data' });
   }
 });
 
+/**
+ * VERIFY DRUG
+ */
 app.get('/api/drugs/verify', async (req, res) => {
   const nrn = sanitize(String(req.query.nrn ?? '')).toUpperCase();
 
   if (!nrn) {
-    return res.status(400).json({ error: 'nrn parameter is required' });
-  }
-
-  if (!/^[A-Z]\d{1,2}-\d{3,6}[A-Z]?$/.test(nrn)) {
-    return res.status(400).json({ error: 'Invalid NAFDAC registration number format' });
+    return res.status(400).json({ error: 'nrn required' });
   }
 
   try {
-    const results = await fetchNafdac({ search: nrn, limit: 10 });
+    const results = await fetchNafdac({ search: nrn });
 
     const exact = results.find(d =>
       d.nrn?.toUpperCase().replace(/\s/g, '') === nrn.replace(/\s/g, '')
@@ -187,10 +153,13 @@ app.get('/api/drugs/verify', async (req, res) => {
     return res.status(404).json(null);
   } catch (err) {
     console.error('[verify error]', err.message);
-    return res.status(502).json({ error: 'Could not reach NAFDAC database.' });
+    res.status(502).json({ error: 'Could not fetch data' });
   }
 });
 
+/**
+ * REPORT DRUG
+ */
 app.post('/api/reports', async (req, res) => {
   const {
     product_name,
@@ -203,11 +172,11 @@ app.post('/api/reports', async (req, res) => {
     platform = ''
   } = req.body;
 
-  if (!product_name || product_name.trim().length < 2) {
+  if (!product_name || product_name.length < 2) {
     return res.status(400).json({ error: 'product_name required' });
   }
 
-  if (!purchase_location || purchase_location.trim().length < 3) {
+  if (!purchase_location || purchase_location.length < 3) {
     return res.status(400).json({ error: 'purchase_location required' });
   }
 
@@ -221,26 +190,26 @@ app.post('/api/reports', async (req, res) => {
     app_version: sanitize(app_version, 20),
     platform: sanitize(platform, 20),
     received_at: new Date().toISOString(),
-    ip: req.ip,
+    ip: req.ip
   };
 
   console.log('[REPORT RECEIVED]', JSON.stringify(report));
 
-  return res.json({
-    message: 'Report received. Thank you for protecting Nigerians.'
-  });
+  res.json({ message: 'Report received successfully' });
 });
 
 // ─── 404 ──────────────────────────────────────────────────────────────────────
-app.use((_, res) => res.status(404).json({ error: 'Not found' }));
+app.use((_, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
 
-// ─── Error handler ────────────────────────────────────────────────────────────
+// ─── ERROR HANDLER ────────────────────────────────────────────────────────────
 app.use((err, req, res, _next) => {
-  console.error('[Unhandled error]', err);
+  console.error('[ERROR]', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+// ─── START SERVER ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
